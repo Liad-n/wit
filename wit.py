@@ -1,4 +1,6 @@
+# Upload 181
 from datetime import datetime, timedelta, timezone
+import difflib
 from filecmp import dircmp
 from fnmatch import filter
 from itertools import product
@@ -10,6 +12,7 @@ from shutil import copy, copyfile, copytree, ignore_patterns, rmtree
 import string
 import sys
 
+import colorama
 from graphviz import Digraph
 
 
@@ -22,6 +25,10 @@ class NotEnoughArgumentsError(Exception):
 
 
 class WitCommandNotFoundError(Exception):
+    pass
+
+
+class NoChangesSinceLastCommitError(Exception):
     pass
 
 
@@ -42,6 +49,10 @@ class BranchExistsError(Exception):
 
 
 class InvalidMergeError(Exception):
+    pass
+
+
+class UnsuitableDiffArgumentError(Exception):
     pass
 
 
@@ -104,6 +115,26 @@ def evaluate_args():
         elif command == 'merge':
             branch_to_merge = args[0]
             merge(branch_to_merge)
+        elif command == 'diff':
+            if args:
+                if args[0] == '--cached':
+                    args.remove('--cached')
+                    if args:
+                        if len(args) == 2:
+                            diff(cached=True, arg_a=args[0], arg_b=args[1])
+                        elif len(args) == 1:
+                            diff(cached=True, arg_a=args[0])
+                        else:
+                            diff(cached=True)
+                else:
+                    if len(args) == 2:
+                        diff(cached=False, arg_a=args[0], arg_b=args[1])
+                    elif len(args) == 1:
+                        diff(cached=False, arg_a=args[0])
+                    else:
+                        diff(cached=False)
+            else:
+                diff(cached=False)
         else:
             raise WitCommandNotFoundError(
                 f"The following command doesn't exist: {command}"
@@ -154,6 +185,11 @@ def commit(message, second_parent_for_merge=None):
     commit_id = gen_hash()
     wit_images_commit_id = Path(wit_root, '.wit', 'images', commit_id)
     wit_staging = Path(wit_root, '.wit', 'staging_area')
+    changes_to_be_committed = get_changes_to_be_committed(
+        wit_root, get_head_commit())
+    if not changes_to_be_committed:
+        raise NoChangesSinceLastCommitError(
+            'Nothing to commit, no changes since commit.')
     copytree(wit_staging, Path(wit_images_commit_id))
     gen_commit_txt(commit_id, message, second_parent_for_merge)
     gen_references(commit_id)
@@ -229,14 +265,10 @@ def checkout(commit_id):
 
 
 def draw_graph(commit_list):
-    enumerated_commits = enumerate(commit_list)
     dot = Digraph(name='.wit/witgraph', comment='Wit Graph', format="png",
                   node_attr={'color': 'lightblue', 'style': 'filled', 'shape': 'circle'})
-    for i, commit_id in enumerated_commits:
-        formatted_commit_id = commit_id[:20] + '\n' + commit_id[20:]
-        dot.node(str(i), formatted_commit_id)
-    input_for_edges = [f'{i}{i + 1}' for i in range(len(commit_list) - 1)]
-    dot.edges(input_for_edges)
+    for i in range(len(commit_list) - 1):
+        dot.edge(commit_list[i], commit_list[i + 1])
 
     dot.view()
 
@@ -248,7 +280,6 @@ def graph():
         head_id = ref['HEAD']
         commits = list(get_all_parent_commits(
             wit_root, head_id, flat=True))[::-1]
-        print(commits)
         draw_graph(commits)
     else:
         raise NoPreviousCommitsError(
@@ -283,7 +314,6 @@ def merge(branch_to_merge):
     current_branch = get_activated_branch(wit_root)
     commit_a, commit_b = find_commit_by_branch_name(
         current_branch), find_commit_by_branch_name(branch_to_merge)
-    print(commit_b, commit_a)
     if commit_a == commit_b:
         raise InvalidMergeError('Branches are already on the same commit.')
 
@@ -305,6 +335,130 @@ def merge(branch_to_merge):
         *changes_branch_to_merge_with_parent), dirs_exist_ok=True)
     commit(
         f'MERGED {current_branch} with {branch_to_merge}!', second_parent_for_merge=commit_b)
+
+
+def diff(cached=False, arg_a=None, arg_b=None):
+    wit_root = find_wit()
+    staging_area = Path(wit_root, '.wit/staging_area')
+    if cached:
+        if arg_a is None and arg_b is None:
+            head_id = get_head_commit()
+            head_dir = get_dir_from_branch_or_commit_id(head_id, wit_root)
+            diff_two_dirs(staging_area, head_dir)
+        elif arg_a and arg_b is None:
+            head_id = get_head_commit()
+            head_dir = get_dir_from_branch_or_commit_id(head_id, wit_root)
+            if Path(arg_a).is_file():
+                diff_file_in_dirs(staging_area, head_dir, arg_a)
+            else:
+                diff_two_dirs(staging_area, arg_a)
+        elif not Path(arg_a).is_file() and Path(arg_b).is_file():
+            diff_file_in_dirs(staging_area, arg_a, arg_b)
+        elif Path(arg_a).is_file() and Path(arg_b).is_file():
+            diff_two_files(arg_a, arg_b)
+    else:
+        if arg_a is None and arg_b is None:
+            diff_two_dirs(wit_root, staging_area)
+        elif arg_a and arg_b is None:
+            if Path(arg_a).is_file():
+                diff_file_in_dirs(wit_root, staging_area, arg_a)
+            else:
+                diff_two_dirs(wit_root, arg_a)
+
+        elif not Path(arg_a).is_file() and Path(arg_b).is_file():
+            diff_file_in_dirs(wit_root, arg_a, arg_b)
+        elif Path(arg_a).is_file() and Path(arg_b).is_file():
+            diff_two_files(arg_a, arg_b)
+        else:
+            diff_two_dirs(arg_a, arg_b)
+
+
+def get_dir_from_branch_or_commit_id(branch_or_commit, wit_root=None):
+    commit_id = ''
+    if wit_root is None:
+        wit_root = find_wit()
+    commit_id_by_branch = find_commit_by_branch_name(branch_or_commit)
+    if commit_id_by_branch:
+        commit_id = commit_id_by_branch
+
+    elif find_commit_by_id(wit_root, branch_or_commit):
+        commit_id = branch_or_commit
+
+    if commit_id:
+        return Path(wit_root, '.wit/images', commit_id)
+    return Path(branch_or_commit)
+
+
+def diff_file_in_dirs(arg_a, arg_b, file):
+    wit_root = find_wit()
+    dir_a = get_dir_from_branch_or_commit_id(arg_a, wit_root)
+    dir_b = get_dir_from_branch_or_commit_id(arg_b, wit_root)
+    try:
+        diff_two_files(str(dir_a.absolute() / file),
+                       str(dir_b.absolute() / file))
+    except FileNotFoundError:
+        logger.warning("File doesn't exist in one of the folders.")
+
+
+def diff_two_dirs(arg_a, arg_b):
+    wit_root = find_wit()
+    dir_a = get_dir_from_branch_or_commit_id(arg_a, wit_root)
+    dir_b = get_dir_from_branch_or_commit_id(arg_b, wit_root)
+    if not (Path(dir_a).exists() and Path(dir_b).exists()):
+        raise UnsuitableDiffArgumentError(
+            'Unable to use those diff arguments, try other ones.')
+    left_only = []
+    right_only = []
+    for root, _dirs, files in os.walk(dir_a):
+        if '.wit' in _dirs:
+            _dirs.remove('.wit')
+        partial_root = Path(root).relative_to(dir_a)
+        dcmp1 = dircmp(Path(dir_b, partial_root), Path(root), ignore=['.wit'])
+        left_only.extend(Path(dir_b, partial_root, f) for f in dcmp1.left_only)
+        right_only.extend(Path(root, f) for f in dcmp1.right_only)
+        for file in files:
+            rel_path = Path(root, file).relative_to(dir_a)
+            if Path(dir_b, rel_path).is_file():
+                diff_two_files(str(Path(dir_a, rel_path)),
+                               str(Path(dir_b, rel_path)))
+    for f in left_only:
+        for line in Path(f).read_text().splitlines():
+            print(colorama.Fore.GREEN + '+' + line)
+    for f in right_only:
+        for line in Path(f).read_text().splitlines():
+            print(colorama.Fore.RED + '-' + line)
+
+
+def diff_two_files(file_a_path, file_b_path):
+    file_a_text = Path(file_a_path).read_text().splitlines()
+    file_b_text = Path(file_b_path).read_text().splitlines()
+
+    diffs = difflib.unified_diff(
+        file_a_text, file_b_text, fromfile=file_a_path, tofile=file_b_path)
+    print_colored(diffs)
+
+
+def print_colored(diff):
+    colorama.init(autoreset=True)
+    for line in diff:
+        if line[0] == '+' and line[0:3] != '+++':
+            print(colorama.Fore.GREEN + line)
+        elif line[0] == '-' and line[0:3] != '---':
+            print(colorama.Fore.RED + line)
+        elif line[0] == '@':
+            print(colorama.Fore.LIGHTBLUE_EX + line)
+        else:
+            print(line)
+
+
+def get_head_commit(wit_root=None):
+    if wit_root is None:
+        wit_root = find_wit()
+    ref = read_references()
+    if ref:
+        return ref['HEAD']
+    else:
+        return ''
 
 
 def get_common_parent(commit_a, commit_b, wit_root=None):
@@ -359,6 +513,8 @@ def get_all_parent_commits(wit_root, commit_id, flat=False):
             if isinstance(parent, list):
                 yield parent[0]
                 yield parent[1]
+            else:
+                yield parent
         else:
             yield parent
         parent = get_parent_commit(wit_root, parent)
@@ -485,7 +641,9 @@ if __name__ == "__main__":
         UnableToCheckoutError,
         NoPreviousCommitsError,
         BranchExistsError,
-        InvalidMergeError
+        InvalidMergeError,
+        NoChangesSinceLastCommitError,
+        UnsuitableDiffArgumentError
     ) as err:
         logger.warning(f'wit: {err}')
     except Exception as err:

@@ -1,4 +1,3 @@
-# Upload 181
 from datetime import datetime, timedelta, timezone
 import difflib
 from filecmp import dircmp
@@ -264,11 +263,22 @@ def checkout(commit_id):
     return commit_id
 
 
+def get_two_line_id(commit_id):
+    first_half = commit_id[:20]
+    second_half = commit_id[20:]
+    return f'{first_half}\n{second_half}'
+
 def draw_graph(commit_list):
     dot = Digraph(name='.wit/witgraph', comment='Wit Graph', format="png",
                   node_attr={'color': 'lightblue', 'style': 'filled', 'shape': 'circle'})
     for i in range(len(commit_list) - 1):
-        dot.edge(commit_list[i], commit_list[i + 1])
+        if isinstance(commit_list[i], list):
+            parent_a, parent_b = commit_list[i]
+            if not isinstance(commit_list[i + 1], list):
+                dot.edge(get_two_line_id(parent_a), get_two_line_id(commit_list[i + 1]))
+                dot.edge(get_two_line_id(parent_b), get_two_line_id(commit_list[i + 1]))
+        else:
+            dot.edge(get_two_line_id(commit_list[i]), get_two_line_id(commit_list[i + 1]))
 
     dot.view()
 
@@ -279,7 +289,7 @@ def graph():
     if ref:
         head_id = ref['HEAD']
         commits = list(get_all_parent_commits(
-            wit_root, head_id, flat=True))[::-1]
+            wit_root, head_id))[::-1]
         draw_graph(commits)
     else:
         raise NoPreviousCommitsError(
@@ -647,4 +657,4 @@ if __name__ == "__main__":
     ) as err:
         logger.warning(f'wit: {err}')
     except Exception as err:
-        logger.error(err)
+        logger.error(f'Something went wrong: {err}', exc_info=True )
